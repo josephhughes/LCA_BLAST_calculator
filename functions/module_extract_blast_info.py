@@ -30,10 +30,13 @@ def extract_blast(input, pident, qcovs, staxid, qaccver):
         with open(input, 'r') as infile:
             for line in infile:
                 pbar.update(len(line))
-                pident_val = line.split('\t')[pident]
-                qcovs_val = line.split('\t')[qcovs]
-                staxid_val = line.split('\t')[staxid]
-                qaccver_val = line.split('\t')[qaccver]
+                cols = line.strip().split('\t')
+                if len(cols) <= max(pident, qcovs, staxid, qaccver):
+                    continue
+                pident_val = cols[pident].strip()
+                qcovs_val = cols[qcovs].strip()
+                staxid_val = cols[staxid].strip()
+                qaccver_val = cols[qaccver].strip()
                 LCA_dict[qaccver_val].append([staxid_val, pident_val, qcovs_val])
                 taxid_list.append(staxid_val)
     taxid_set = set(taxid_list)
@@ -80,22 +83,39 @@ def tax_lineage(taxid_set, ranks, taxid_info, names_info):
         tax_line = {}
         correct_order_lineage = {}
         ktax = tax
+        # Check if the initial TaxID exists in taxid_info
+        if ktax not in taxid_info:
+            # If TaxID not found, create empty lineage with 'nan' for all ranks
+            for key in rank_dict:
+                true_lineage[ktax].append([key, 'nan', 'nan'])
+            continue
+        
         for i in range(10000000):
             if tax in taxid_info:
-                lineage[taxid_info[tax][0]] = tax
-                if taxid_info[tax][0] in ranks:
-                    tax_line[taxid_info[tax][0]] = tax
+                rank_found = taxid_info[tax][0]
+                lineage[rank_found] = tax
+                # Standard rank match
+                if rank_found in rank_dict:
+                    tax_line[rank_found] = tax
+                # Handle 'domain' mapping to 'superkingdom'
+                elif rank_found == 'domain' and 'superkingdom' in rank_dict:
+                    tax_line['superkingdom'] = tax
+                
                 if tax == taxid_info[tax][1]:
                     break
                 else:
                     tax = taxid_info[tax][1]
+            else:
+                # If we encounter a missing parent TaxID, stop traversal
+                break
+        
         for key in rank_dict:
             if key in tax_line:
                 correct_order_lineage[key] = tax_line[key]
             else:
                 correct_order_lineage[key] = 'nan'
         for k, v in correct_order_lineage.items():
-            if v in names_info:
+            if v != 'nan' and v in names_info:
                 true_lineage[ktax].append([k, v, names_info[v]])
             else:
                 true_lineage[ktax].append([k, v, 'nan'])
@@ -109,6 +129,11 @@ def calculate_lca(LCA_dict, PIDENT, QCOV, RANKS, lineage):
         count = 0
         for v in LCA_dict[item]:
             if float(v[1]) >= float(PIDENT) and float(v[2]) >= float(QCOV):
+                # Check if TaxID exists in lineage before accessing
+                if v[0] not in lineage:
+                    # Skip this BLAST hit if TaxID not found in lineage
+                    continue
+                
                 spec_lin = ''
                 ranks_test = RANKS.split('+')
                 for index in range(len(ranks_test)):
