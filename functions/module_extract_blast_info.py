@@ -72,85 +72,112 @@ def extract_names(names):
     return name_dict
 
 def tax_lineage(taxid_set, ranks, taxid_info, names_info):
-    rank_dict = {}
+    """
+    Generate taxonomic lineages for a set of TaxIDs.
+    Uses caching to avoid redundant tree traversals.
+    """
     rank_list = ranks.split('+')
-    for item in rank_list:
-        rank_dict[item] = 'yes'
+    rank_dict = {rank: True for rank in rank_list}
     true_lineage = collections.defaultdict(list)
-    true_lineage_test = {}
-    for tax in tqdm(taxid_set):
-        lineage = {}
-        tax_line = {}
-        correct_order_lineage = {}
+    
+    # Cache for full lineage paths to avoid re-traversing the same nodes
+    # Stores: {taxid: {rank: taxid, ...}}
+    path_cache = {}
+
+    for tax in tqdm(taxid_set, desc="Resolving lineages"):
         ktax = tax
-        # Check if the initial TaxID exists in taxid_info
         if ktax not in taxid_info:
-            # If TaxID not found, create empty lineage with 'nan' for all ranks
-            for key in rank_dict:
-                true_lineage[ktax].append([key, 'nan', 'nan'])
+            true_lineage[ktax] = [[rank, 'nan', 'nan'] for rank in rank_list]
             continue
         
-        for i in range(10000000):
-            if tax in taxid_info:
-                rank_found = taxid_info[tax][0]
-                lineage[rank_found] = tax
-                # Standard rank match
-                if rank_found in rank_dict:
-                    tax_line[rank_found] = tax
-                # Handle 'domain' mapping to 'superkingdom'
-                elif rank_found == 'domain' and 'superkingdom' in rank_dict:
-                    tax_line['superkingdom'] = tax
-                
-                if tax == taxid_info[tax][1]:
-                    break
-                else:
-                    tax = taxid_info[tax][1]
-            else:
-                # If we encounter a missing parent TaxID, stop traversal
-                break
+        # Build full taxonomic path for this TaxID
+        tax_path = {}
+        curr = tax
+        visited = set()
         
-        for key in rank_dict:
-            if key in tax_line:
-                correct_order_lineage[key] = tax_line[key]
-            else:
-                correct_order_lineage[key] = 'nan'
-        for k, v in correct_order_lineage.items():
-            if v != 'nan' and v in names_info:
-                true_lineage[ktax].append([k, v, names_info[v]])
-            else:
-                true_lineage[ktax].append([k, v, 'nan'])
+        while curr in taxid_info:
+            if curr in visited: # Cycle detection
+                break
+            visited.add(curr)
+            
+            rank_found = taxid_info[curr][0]
+            # Map 'domain' to 'superkingdom' if needed
+            if rank_found == 'domain' and 'superkingdom' in rank_dict:
+                rank_found = 'superkingdom'
+            
+            if rank_found in rank_dict:
+                tax_path[rank_found] = curr
+            
+            parent = taxid_info[curr][1]
+            if curr == parent: # Reached root
+                break
+            
+            # Use cache if we've already resolved the rest of the path
+            if parent in path_cache:
+                tax_path.update(path_cache[parent])
+                break
+                
+            curr = parent
+            
+        # Store resolved path in cache (for future use by other TaxIDs)
+        path_cache[ktax] = tax_path
+        
+        # Format lineage according to requested ranks
+        for rank in rank_list:
+            v = tax_path.get(rank, 'nan')
+            name = names_info.get(v, 'nan') if v != 'nan' else 'nan'
+            true_lineage[ktax].append([rank, v, name])
         
     return true_lineage
 
 def calculate_lca(LCA_dict, PIDENT, QCOV, RANKS, lineage):
+    """
+    Calculate the Lowest Common Ancestor for each query based on filtered BLAST hits.
+    Uses list-based prefix matching for robustness.
+    """
     LCA_final = {}
-    for item in tqdm(LCA_dict):
-        temp = []
-        count = 0
+    ranks_list = RANKS.split('+')
+    
+    for item in tqdm(LCA_dict, desc="Calculating LCA"):
+        hits_lineages = []
+        blast_hit_number = 0
+        
         for v in LCA_dict[item]:
+            # Filter by percent identity and query coverage
             if float(v[1]) >= float(PIDENT) and float(v[2]) >= float(QCOV):
-                # Check if TaxID exists in lineage before accessing
                 if v[0] not in lineage:
-                    # Skip this BLAST hit if TaxID not found in lineage
                     continue
                 
-                spec_lin = ''
-                ranks_test = RANKS.split('+')
-                for index in range(len(ranks_test)):
-                    spec_lin = spec_lin + lineage[v[0]][index][2] + ';'
-                temp.append(spec_lin)
-                count = count + 1
-        blast_hit_number = count
-        pract = os.path.commonprefix(temp)
-        if pract.endswith(';'):
-            result = pract.rstrip(';')
-        else:
-            result = pract.rsplit(';', 1)[0]
-        if result == '':
-            obtained_rank = 'NA'
-        else:
-            obtained_rank = ranks_test[len(result.split(';')) -1]
-        LCA_final[item] = result + '___' + obtained_rank + '___' + str(blast_hit_number)
+                # Get the lineage as a list of scientific names
+                names = [rank_info[2] for rank_info in lineage[v[0]]]
+                hits_lineages.append(names)
+                blast_hit_number += 1
+        
+        if not hits_lineages:
+            LCA_final[item] = {
+                'lineage': 'na',
+                'rank': 'na',
+                'hits': 0
+            }
+            continue
+
+        # Find common prefix across all hits
+        common_names = []
+        for i in range(len(ranks_list)):
+            level_names = set(h[i] for h in hits_lineages)
+            if len(level_names) == 1 and 'nan' not in level_names:
+                common_names.append(list(level_names)[0])
+            else:
+                break
+        
+        result_lineage = ";".join(common_names) if common_names else 'NA'
+        obtained_rank = ranks_list[len(common_names)-1] if common_names else 'NA'
+        
+        LCA_final[item] = {
+            'lineage': result_lineage,
+            'rank': obtained_rank,
+            'hits': blast_hit_number
+        }
     
     return LCA_final
                 
@@ -168,26 +195,54 @@ def read_otutable(FREQ):
     return otutable
 
 def combine_data(otutable, LCA_final, OUTPUT):
-    LCA_total = {}
-    for item in tqdm(otutable):
-        if item.startswith('#'):
-            LCA_total[item] = 'taxonomic_lineage___rank___blast_hit_number___' + otutable[item]
-        elif item not in LCA_final:
-            LCA_total[item] = 'na___na___na___' + otutable[item]            
-        else:
-            LCA_total[item] = LCA_final[item] + '___' + otutable[item]
-
-    print(f'write data to {OUTPUT}')       
+    """
+    Combine LCA results with the original OTU frequency table.
+    """
+    print(f'writing combined data to {OUTPUT}')
     with open(OUTPUT, 'w') as outfile:
-        for item in tqdm(LCA_total):
-            outfile.write(item + '\t' + LCA_total[item].split('___')[1] + '\t' + LCA_total[item].split('___')[2]+ '\t' + LCA_total[item].split('___')[0] + '\t' + LCA_total[item].split('___')[3] + '\n')
+        # Sort and process in order
+        for item in tqdm(otutable, desc="Exporting"):
+            if item.startswith('#'):
+                # Header row: add our new columns
+                headers = [
+                    'qaccver',
+                    'rank',
+                    'blast_hit_number',
+                    'taxonomic_lineage',
+                    otutable[item]
+                ]
+                outfile.write("\t".join(headers) + "\n")
+                continue
+            
+            samples = otutable[item]
+            if item not in LCA_final:
+                lineage = 'na'
+                rank = 'na'
+                hits = 'na'
+            else:
+                res = LCA_final[item]
+                lineage = res['lineage']
+                rank = res['rank']
+                hits = str(res['hits'])
+            
+            row = [item, rank, hits, lineage, samples]
+            outfile.write("\t".join(row) + "\n")
 
 def export_lca(LCA_final, output):
+    """
+    Export LCA results to a tab-delimited file.
+    """
+    print(f'exporting LCA results to {output}')
     with open(output, 'w') as outfile:
-        count = 0
-        for item in tqdm(LCA_final):
-            if count == 0:
-                outfile.write('#qaccver' + '\t' + 'rank' + '\t' + 'blast_hit_number' + '\t' + 'taxonomic_lineage')
-                count = count + 1
-            else:
-                outfile.write(item + '\t' + LCA_final[item].split('___')[1] + '\t' + LCA_final[item].split('___')[2] + '\t' + LCA_final[item].split('___')[0] + '\n')
+        # Write header
+        outfile.write('#qaccver\trank\tblast_hit_number\ttaxonomic_lineage\n')
+        
+        for item in tqdm(LCA_final, desc="Exporting"):
+            res = LCA_final[item]
+            row = [
+                item,
+                res['rank'],
+                str(res['hits']),
+                res['lineage']
+            ]
+            outfile.write("\t".join(row) + "\n")
